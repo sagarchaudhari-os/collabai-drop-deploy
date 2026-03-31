@@ -1,0 +1,187 @@
+import mongoose from 'mongoose';
+import validator from 'validator';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import config from '../config.js';
+import paginate  from 'mongoose-paginate-v2';
+import crypto from 'crypto';
+export const UserRole = {
+	SUPER_ADMIN: 'superadmin',
+	ADMIN: 'admin',
+	USER: 'user',
+};
+const userSchema = new mongoose.Schema(
+	{
+		maxusertokens: {
+			type: Number,
+			default: 5000,
+		},
+		currentusertokens: {
+			type: Number,
+			default: 0,
+		},
+		fname: {
+			type: String,
+			required: [true, 'Please provide name'],
+			maxlength: 50,
+			minlength: 2,
+		},
+		lname: {
+			type: String,
+			required: [true, 'Please provide name'],
+			maxlength: 50,
+			minlength: 2,
+		},
+		username: {
+			type: String,
+			required: [true, 'Please provide name'],
+			maxlength: 50,
+			minlength: 3,
+			unique: true,
+		},
+		password: {
+			type: String,
+			required: [true, 'please provide a password'],
+			// maxlength: 50,
+			minlength: 3,
+		},
+		email: {
+			type: String,
+			unique: true,
+			required: [true, 'Please provide email'],
+			validate: {
+				validator: validator.isEmail,
+				message: 'Please provide valid email',
+			},
+		},
+		status: {
+			type: String,
+			enum: ['active', 'inactive'],
+			default: 'inactive',
+		},
+
+		isGoogleLogin: {
+			type: Boolean,
+			default: false,
+			required: false,
+		},
+
+		role: {
+			type: String,
+			enum: ['superadmin', 'admin', 'user'],
+			default: 'user',
+		},
+		companyId: {
+			type: String,
+			required: [true, 'Please provide company'],
+		},
+		deletedEmail: {
+			type: String,
+		},
+		teamId: {
+			type: mongoose.Schema.Types.ObjectId,
+			ref: 'Teams',
+		},
+		teams: [
+			{
+				type: mongoose.Schema.Types.ObjectId,
+				ref: 'Teams'
+			}
+		],
+		userPreferences: {
+			type: String,
+		},
+		desiredAiResponse: {
+			type: String,
+		},
+		designation: {
+			type: String,
+			required: false,
+		},
+		responsibility: {
+			type: String,
+			required: false,
+		},
+		companyInformation: {
+			type: String,
+			required: false,
+		},
+		userAvatar: {
+			type: String,
+			required: false,
+		},
+		userAcToken: {
+			type: String,
+			required: false,
+ 		},
+		 _badgeId: {
+			type:String,
+			default: 'globalBadge'
+		},
+		isPushVisible: {
+			type: Boolean,
+			default: false 
+		},
+		apiKey: {
+			type: String,
+			unique: true,
+			required: false,
+		},
+		apiKeyCreatedAt: {
+			type: Date,
+			required: false,
+		},
+		// n8n integration fields
+		isN8nConnected: {
+			type: Boolean,
+			default: false,
+		},
+		n8nSecretKey: {
+			type: String,
+			required: false,
+		},
+		aiSuggestionsEnabled: {
+			type: Boolean,
+			default: true,
+		},
+	},
+	{ timestamps: true }
+);
+
+userSchema.plugin(paginate);
+
+userSchema.pre('save', async function () {
+		   // Generate apiKey if not present
+	if (!this.apiKey) {
+			   this.apiKey = crypto.randomBytes(32).toString('hex');
+	}
+	if (!this.isModified('password')) return;
+	const salt = await bcrypt.genSalt(10);
+	this.password = await bcrypt.hash(this.password, salt);
+	this.email = this.email.toLowerCase(); // convert email to lowercase
+	this.username = this.username.toLowerCase(); // convert email to lowercase
+});
+
+userSchema.methods.comparePasword = async function (userPassword) {
+	const isMatch = await bcrypt.compare(userPassword, this.password);
+	return isMatch;
+};
+
+userSchema.methods.createJWT = function () {
+	return jwt.sign(
+		{
+			userId: this._id,
+			email: this.email,
+			role: this.role,
+			branch: this.branch,
+		},
+		config.JWT_SECRET,
+		{
+			// expiresIn: process.env.JWT_LIFETIME,
+			expiresIn: '30d',
+		}
+	);
+};
+
+const User = mongoose.model('User', userSchema);
+export default User;

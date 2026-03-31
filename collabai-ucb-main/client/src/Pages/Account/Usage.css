@@ -1,0 +1,35 @@
+.usage-container {
+    position: relative;
+    width: 1;
+}
+
+.usage-report-container{
+    color: aliceblue;
+    gap: 1rem;
+    display: flex;
+    align-items: center;
+    justify-content: start !important;
+    margin: 0;
+    padding: 0;
+    z-index: 99999999999999 !important;
+    .typo-card {
+        border-color: var(--border-color);
+        .ant-card-body {
+            padding: 5px 10px !important;
+        }
+    }
+}
+
+.scrollable-list {
+    max-height: 61vh;
+    overflow-y: auto;
+    margin-bottom: 20px;
+}
+
+@media screen and (max-width: 1024px) {
+    .usage-report-container {
+        position: unset !important;
+        flex-direction: row !important;
+        flex-wrap: nowrap !important;
+    }
+  }

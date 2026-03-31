@@ -1,0 +1,233 @@
+// /sockets/chat/chatHandler.js
+
+// libraries
+import OpenAI from "openai";
+
+import { getOpenAIInstance } from "../../config/openAI.js";
+
+// utils
+import { PromptMessages } from "../../constants/enums.js";
+import { handleOpenAIError } from "../../utils/openAIErrors.js";
+import {
+  addMessageToThread,
+  createAssistantThreadInDb,
+  getAssistantByAssistantID,
+  validateUserPromptForAssistant,
+} from "../../service/assistantService.js";
+import {
+  createAssistantThread,
+  createMessageInThread,
+  streamRunInThread,
+  submitToolOutputsAndStream,
+} from "../../lib/openai.js";
+import { getUserDetails } from "../../service/userService.js";
+import { onTextDelta, onToolCallDelta, onToolCalls } from "../../utils/assistant.js";
+import { calculateCostFromTokenCounts, createTrackUsage } from "../../service/trackUsageService.js";
+
+/**
+ * Creates an assistant chat and initiates streaming of responses from the assistant.
+ *
+ * @param {Object} payload - The payload containing the necessary information for creating the assistant chat.
+ * @param {string} payload.question - The user's question.
+ * @param {string} payload.thread_id - The ID of the thread (optional).
+ * @param {string} payload.assistant_id - The ID of the assistant.
+ */
+export const createAssistantChatAndStream = async function (payload) {
+  const socket = this;
+  const resSocketEvent = "chat:created";
+
+  try {
+    const { question, thread_id, assistant_id } = payload;
+    console.log("payload : ",payload);
+
+    // Constructing the final response object to emit to the client
+    const result = {
+      ...payload,
+      success: true,
+      promptResponse: "",
+      codeInterpreterOutput: "",
+      isCompleted: false,
+      message: PromptMessages.CHAT_CREATION_SUCCESS,
+      thread_id: thread_id ? thread_id : null,
+      runId: ''
+    };
+
+    const validationResult = validateUserPromptForAssistant({ question });
+
+    if (validationResult.error) {
+      return socket.emit(resSocketEvent, {
+        success: false,
+        message:
+          "The message you submitted was too long, please reload the conversation and submit something shorter.",
+      });
+    }
+
+    const openai = await getOpenAIInstance();
+
+    // Step 1: create a thread if doesn't exist for the requested user
+    let threadObjectId = null;
+    console.log("result.thread_id : ",result?.thread_id, " thread_id : ", thread_id);
+    if (!result.thread_id) {
+      const thread = await createAssistantThread(openai);
+      result.thread_id = thread.id;
+
+      const dbThreadCreate = await createAssistantThreadInDb(
+        assistant_id,
+        socket.user.userId,
+        thread.id,
+        question.substring(0, 50)
+      );
+      threadObjectId = dbThreadCreate._id;
+    }
+
+    // Step 1.2: check if assistant exists in database
+    const existingAssistant = await getAssistantByAssistantID(assistant_id);
+
+    const messageResponse = await createMessageInThread(
+      openai,
+      assistant_id,
+      result.thread_id,
+      question,
+      socket.user.userId
+    );
+
+    let currentToolBuffer = '';
+    let completeCodeInterpreterOutput = '';
+
+    const triggerClientUpdate = () => {
+      console.log("Emitting to client: resSocketEvent :",resSocketEvent, " result :", result);
+      socket.emit(resSocketEvent, {
+        ...result,
+      });
+    }
+    
+    const closeCurrentResponse = () => {
+      if (currentToolBuffer) {
+        const wrappedResponse = `<interpretedMessage>\n${currentToolBuffer}\n</interpretedMessage>`;
+        completeCodeInterpreterOutput += wrappedResponse;
+        result.codeInterpreterOutput = completeCodeInterpreterOutput;
+        currentToolBuffer = '';
+        triggerClientUpdate();
+      }
+    };
+
+    const observeRunStream = (stream) => {
+      stream
+        .on("textDelta", async (textDelta) => {
+          let response = await onTextDelta(textDelta);
+          if (response) {
+            result.promptResponse += response;
+            result.promptResponse = textDelta?.annotations?.length ? result.promptResponse.replace(/[-.\di\s]*\[\s*.*?\]\(.*?\)/g, '') : result.promptResponse; 
+          }
+          const currentRun = stream.currentRun();
+          result.runId = currentRun.id;
+          triggerClientUpdate();
+        })
+        .on("toolCallDelta", async (toolCallDelta) => {
+          let response = await onToolCallDelta(toolCallDelta);
+          if (response) {
+            currentToolBuffer += response;
+            result.codeInterpreterOutput = completeCodeInterpreterOutput + `<interpretedMessage>\n${currentToolBuffer}`;
+          }
+          const currentRun = stream.currentRun();
+          result.runId = currentRun.id;
+          triggerClientUpdate();
+        })
+        .on("end", async () => {
+          const currentRun = stream.currentRun();
+          result.runId = currentRun.id;
+          if (
+            currentRun.status === "requires_action" &&
+            currentRun.required_action.type === "submit_tool_outputs" 
+          ) {
+            closeCurrentResponse();
+            let toolCalls = currentRun.required_action.submit_tool_outputs.tool_calls;
+              const userDetails = await getUserDetails(socket.user.userId);
+
+
+              toolCalls = toolCalls.map(item => {
+                const args = JSON.parse(item.function.arguments);
+                item.function.arguments = JSON.stringify(args);
+                return item;
+              });
+              
+              const toolOutputs = await onToolCalls(
+                assistant_id,
+                toolCalls,
+                existingAssistant?.functionCalling,
+                userDetails._id
+              );
+            
+            const runStreamAfterToolSubmit = submitToolOutputsAndStream(
+              openai,
+              result.thread_id,
+              currentRun.id,
+              toolOutputs
+            );
+            
+            observeRunStream(runStreamAfterToolSubmit);
+          } else {
+            closeCurrentResponse();
+            result.isCompleted = true;
+            // Step 3: Update the AssistantThread with msg_id and codeInterpreterOutput
+            await addMessageToThread(
+              result.thread_id,
+              messageResponse.id,
+              result.codeInterpreterOutput || null
+            );
+          }          
+          triggerClientUpdate();
+        }).on("done", async (data) => {
+          result.isCompleted = true;
+          triggerClientUpdate();
+        }).on("error", async (error) => {
+          throw new Error(error);
+        });
+    };
+
+    const runStreams = streamRunInThread(openai, result.thread_id, assistant_id);
+    observeRunStream(runStreams);
+
+    // retrieving finalRun object to get usage details
+    const finalRun = await runStreams.finalRun();
+    const {
+      inputTokenPrice,
+      outputTokenPrice,
+      inputTokenCount,
+      outputTokenCount,
+      totalCost,
+      totalTokens
+  } = calculateCostFromTokenCounts(
+      finalRun?.usage?.prompt_tokens,
+			finalRun?.usage?.completion_tokens,
+			finalRun?.model,
+			'openai'
+		);
+    await createTrackUsage({
+      userId: socket.user.userId,
+      inputTokenCount,
+      outputTokenCount,
+      modelUsed: finalRun.model,
+      inputTokenPrice,
+      outputTokenPrice,
+      totalTokens,
+      totalCost
+    });
+  } catch (error) {
+    console.error("Error in createChat handler:", error);
+    let message = PromptMessages.CHAT_CREATION_ERROR;
+
+    // Specific error handling for OpenAI errors
+    if (error instanceof OpenAI.APIError) {
+      message = handleOpenAIError(error).message;
+    }
+
+    // Emitting error to the client
+    socket.emit(resSocketEvent, {
+      success: false,
+      message: message,
+      error: JSON.stringify(error),
+      errorMessage: error?.message
+    });
+  }
+};

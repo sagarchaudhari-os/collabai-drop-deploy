@@ -1,0 +1,19 @@
+import mongoose, { Schema } from "mongoose";
+
+const favouriteAssistant = new Schema({
+    assistant_id: {
+        type: String,
+        ref: 'Assistant',
+        required: true,
+    },
+    user_id: {
+        type: Schema.Types.ObjectId,
+        ref: 'User',
+        required: true
+    }
+});
+
+const FavouriteAssistant = mongoose.model('favourite_assistant', favouriteAssistant);
+
+export default FavouriteAssistant;
+
